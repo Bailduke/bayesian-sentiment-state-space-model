@@ -1,0 +1,10 @@
+.env
+*.txt
+*.pdf
+*.png
+*.csv
+*.db
+*.json
+
+__pycache__/
+.venv/
