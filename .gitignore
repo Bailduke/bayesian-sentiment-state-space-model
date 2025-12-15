@@ -7,4 +7,4 @@
 *.json
 
 __pycache__/
-.venv/news_classifier/telegram_news/README.md
+.venv/
