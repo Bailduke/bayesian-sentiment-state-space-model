@@ -85,7 +85,6 @@ def main() -> None:
                 logger.warning(f"[{ch}] skipped: {e.__class__.__name__}: {e}")
             except Exception as e:
                 logger.error(f"[{ch}] error: {e}")
-
     with client:
         client.loop.run_until_complete(runner())
     conn.close()
