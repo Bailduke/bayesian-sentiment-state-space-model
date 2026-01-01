@@ -1,0 +1,1142 @@
+---
+title: "Bayesian Space State Model for News Sentiment Temporal Analysis"
+author: "Ian Carbó Casals"
+date: "2025-12-29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Config
+
+```{r}
+time_mode <- "week"   # "week" or "ndays"
+k_days    <- 1        # if "ndays", how many (elif "week", k_days will be ignored)
+
+news <- read.csv("/home/ian/Projects/BayesianNewsSentiment/dataset_news.csv")
+
+# libraries
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(R2jags)
+library(coda)
+library(stringr)
+
+# to ensure consistent results across runs (reproducibility)
+set.seed(123)
+
+# Note: exact numerical reproducibility may vary slightly across platforms and JAGS versions,
+# but setting a seed ensures consistent behavior within a given software environment.
+```
+
+## Dataset
+
+```{r}
+df <- news %>% 
+  mutate(
+    # From UNIX to date EUR/MADRID
+    date_spain = as.POSIXct(date_unix, origin = "1970-01-01", tz = "Europe/Madrid")
+  )
+
+df <- df %>% 
+  mutate(
+    # Week start for each row
+    week_start = floor_date(date_spain, unit = "week", week_start = 1)
+  ) %>% 
+  group_by(week_start) %>% 
+  mutate(
+    # number of weeks since the first news of the data: 1, 2, 3, ...
+    week_id = cur_group_id()
+  ) %>% 
+  ungroup() %>%
+  arrange(date_unix) # sort by date ascending
+
+df <- df %>% 
+  mutate(
+    # add spain date of each news
+    day = as.Date(date_spain, tz = "Europe/Madrid")
+  ) %>% 
+  group_by(day) %>% 
+  mutate(
+    # number of days since the first news in the data: 1, 2, 3, ...
+    day_id = cur_group_id()
+  ) %>% 
+  ungroup()
+
+if (time_mode == "ndays") {
+  ref_day <- min(df$day)   # reference day (1st day with news)
+  
+  df <- df %>% 
+    mutate(
+      days_from_ref = as.integer(difftime(day, ref_day, units = "days")),
+      day_id       = days_from_ref %/% k_days + 1   # k_days blocks
+    )
+  df$days_from_ref <- NULL
+}
+
+# set the temporal id
+if (time_mode == "week") {
+  temporal_id <- df$week_id
+} else if (time_mode == "ndays") {
+  temporal_id <- df$day_id
+} else {
+  stop("time_mode must be 'week' or 'ndays'")
+}
+
+cat_threshold <- 0.25
+
+# define C matrix
+C <- df %>%
+  dplyr::select(-channel, -id, -date_unix, -positive, -neutral, -negative, -week_id, 
+                 -date_spain, -week_start, -day_id, -day)
+C <- as.matrix(C)
+
+# hard threshold
+C[C<cat_threshold] <- 0
+```
+
+Histogram of the weight of each category and heatmap.
+```{r}
+par(mfrow = c(2, 4))
+for (j in 1:8) {
+  hist(
+    C[, j],
+    main = colnames(C)[j]
+  )
+}
+
+# temporal_id     -> time idx (t)
+# C               -> matrix N x M scores: i news, j category (cut and normalized)
+
+# C to long
+df_C_long <- as.data.frame(C) %>%
+  mutate(row_id = dplyr::row_number()) %>%
+  pivot_longer(
+    cols = -row_id,
+    names_to = "category",
+    values_to = "score"
+  )
+# Add the temporal id
+df_C_long <- df_C_long %>%
+  mutate(temporal_id = temporal_id[row_id])
+
+# add for (t, category) -> mean and median
+df_Ct <- df_C_long %>%
+  group_by(temporal_id, category) %>%
+  summarise(
+    mean_score   = mean(score, na.rm = TRUE),
+    median_score = median(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+ggplot(df_Ct, aes(x = temporal_id, y = category, fill = mean_score)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(
+    x = "Time",
+    y = "Category",
+    fill = "Mean score",
+    title = "Category scores heatmap (mean by time interval)"
+  ) +
+  theme_minimal()
+```
+
+### Data transformation
+
+Sports and domestic politics are categories we have gaps. So we will not consider them in our analysis.
+```{r}
+# y: N x M
+N <- max(temporal_id)
+
+categories_to_delete <- c("sports_entertainment_and_culture", "domestic_politics_elections_and_government") 
+C2 <- as.data.frame(C) %>% select(-categories_to_delete)
+C2 <- as.matrix(C2)
+M <- ncol(C2)
+attach(df)
+n <- matrix(nrow=N,ncol=M)
+colnames(n) <- colnames(C2)
+y <- matrix(nrow=N,ncol=M)
+colnames(y) <- colnames(C2)
+for (t in 1:N) {
+  idx <- temporal_id==t
+  Ct <- C2[idx,]
+  post <- positive[idx]
+  neut <-neutral[idx]
+  negt <- negative[idx]
+  St <- (post-negt)
+  for (j in 1:M){
+    Ctj <- Ct[,j]
+    n[t,j] <- sum(Ctj)
+    if (n[t,j] > 0){
+      y[t,j] <- t(St)%*%Ctj/n[t,j]
+    }
+  }
+}
+detach(df)
+
+# format long with t as temporal idx
+df_y <- as.data.frame(y) %>%
+  mutate(t = 1:N) %>%        #temporal idx (week 1,2,...)
+  pivot_longer(
+    cols = -t,
+    names_to = "category",
+    values_to = "sentiment"
+  )
+
+#df_y <- df_y[df_y$t <= 50,] # to just visualize until 50th week
+
+# plot of sentiment evolution per category
+ggplot(df_y, aes(x = t, y = sentiment, color = category)) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Time",
+    y = "Average Sentiment",
+    color = "Category",
+    title = "Evolution of the sentiment by category (Δt=weekly)"
+  ) +
+  ylim(-0.7,0.5) +
+  theme_minimal()
+
+```
+
+## Models
+
+The paper reports results from the hierarchical model (partial pooling across categories) [general model]. The simple and intermediate specifications are included for comparison.
+
+
+### Simple Model
+
+For a first model we will generalize and consider that the $\sigma$, $\sigma_\eta$ and $\theta$ are the same for all categories and that it does not change by time.
+```{r}
+BUGS.simple_model <- "
+model
+{
+  for (j in 1:M){
+    
+    # hidden state
+    x[1,j] <- mu[j] + eps[1,j]*sigma.eta
+    eps[1,j] ~ dnorm(0,1)
+    for (t in 2:N){
+      x[t,j] <- (1-theta)*mu[j] + theta*x[t-1,j]+ sigma.eta*eps[t,j]
+      eps[t,j] ~ dnorm(0,1)
+    }
+    
+    # observed
+    for (t in 1:N){
+      y[t,j] ~ dnorm(x[t,j], tau*n[t,j])
+    }
+    
+    mu_aux[j] ~ dbeta(1,1) # in (0,1)
+    mu[j] <- 2*mu_aux[j]-1 # in (-1,1)
+  }
+  
+  theta_aux ~ dnorm(mu_theta, pow(sigma_theta, -2))
+  theta <- 1 / (1 + exp(-theta_aux))
+  
+  # Lognormal distributions for the sd
+  # SD dynamic
+  log_sigma.eta ~ dnorm(mu_log_sigma.eta, pow(sigma_log_sigma.eta, -2))
+  sigma.eta <- exp(log_sigma.eta)
+  tau.eta <- pow(sigma.eta, -2)
+  
+  # SD obs
+  log_sigma ~ dnorm(mu_log_sigma, pow(sigma_log_sigma, -2))
+  sigma <- exp(log_sigma)
+  tau <- pow(sigma, -2)
+  
+  # Priors
+  # theta
+  mu_theta ~ dnorm(0,1)
+  log_sigma_theta ~ dnorm(0,4)
+  sigma_theta <- exp(log_sigma_theta)
+  
+  # sigma.eta
+  mu_log_sigma.eta ~ dnorm(-3,1) # center arround exp(-3)=0.05
+  log_sigma_log_sigma.eta ~ dnorm(-0.7,4) # mean exp(-0.7)=0.50, sdlog=0.5
+  sigma_log_sigma.eta <- exp(log_sigma_log_sigma.eta)
+  
+  # sigma
+  mu_log_sigma ~ dnorm(-3,1)
+  log_sigma_log_sigma ~ dnorm(-0.7,4)
+  sigma_log_sigma <- exp(log_sigma_log_sigma)
+  
+}
+"
+```
+
+Train model and traceplot.
+```{r}
+data <- list(y=y, n=n, M=M, N=N)
+
+parameters <- c("mu", "tau", "sigma.eta", "sigma", "theta", "x", "eps")
+
+
+# discarded "Burn", save "Iter", chains "Chain"
+Iter <- 10000
+Burn <- 5000
+Chain <- 3
+Thin <- 25
+
+# discarded "Burn", save "Iter" every "Thin", 
+# it means BUGS will simulate Burn+Iter*Thin for every chain,
+# the number of chains is"Chain"
+
+simple_model <-jags(data, parameters.to.save=parameters,
+ 		   model=textConnection(BUGS.simple_model),
+		   n.iter=(Iter*Thin+Burn),n.burnin=Burn, n.thin=Thin, n.chains=Chain)
+
+
+traceplot(simple_model , mfrow = c(2,2), varname = c("mu", "sigma", "sigma.eta", "theta"))
+```
+
+Save parameters and show its summary.
+```{r}
+attach.jags(simple_model)
+smu <- mu
+colnames(smu) <- colnames(C2)
+ssigma <- sigma
+ssigma.eta <- sigma.eta
+stheta <- theta
+sx <- x
+seps <- eps
+detach.jags()
+
+summary(smu)
+summary(ssigma)
+summary(ssigma.eta)
+summary(stheta)
+summary(sx)
+summary(seps)
+```
+
+### General model
+
+To share information across categories while allowing category-specific behavior, we place hierarchical priors on the persistence ($\theta$) and noise parameters ($\sigma$ and $\sigma_\eta$).
+```{r}
+BUGS.general_model <- "
+model
+{
+  for (j in 1:M){
+    
+    # hidden state
+    #x[1,j] ~ dnorm(mu[j], tau.eta[j])
+    x[1,j] <- mu[j] + eps[1,j]*sigma.eta[j]
+    eps[1,j] ~ dnorm(0,1)
+    for (t in 2:N){
+      x[t,j] <- (1-theta[j])*mu[j] + theta[j]*x[t-1,j]+ sigma.eta[j]*eps[t,j]
+      #x[t,j] ~ dnorm((1-theta[j])*mu[j] + theta[j]*x[t-1,j], tau.eta[j])
+      eps[t,j] ~ dnorm(0,1)
+    }
+    
+    # observed
+    for (t in 1:N){
+      y[t,j] ~ dnorm(x[t,j], tau[j]*n[t,j])
+    }
+    
+    mu_aux[j] ~ dbeta(1,1) # in (0,1)
+    mu[j] <- 2*mu_aux[j]-1 # in (-1,1)
+    #theta[j] ~ dbeta(1,1)
+  }
+  
+  for (j in 1:M){
+    theta_aux[j] ~ dnorm(mu_theta, pow(sigma_theta, -2))
+    theta[j] <- 1 / (1 + exp(-theta_aux[j]))
+    
+    # Lognormal distributions for the sd
+    # SD dynamic
+    log_sigma.eta[j] ~ dnorm(mu_log_sigma.eta, pow(sigma_log_sigma.eta, -2))
+    sigma.eta[j] <- exp(log_sigma.eta[j])
+    tau.eta[j] <- pow(sigma.eta[j], -2)
+    
+    # SD obs
+    log_sigma[j] ~ dnorm(mu_log_sigma, pow(sigma_log_sigma, -2))
+    sigma[j] <- exp(log_sigma[j])
+    tau[j] <- pow(sigma[j], -2)
+  }
+  
+  mu_theta ~ dnorm(0,1)
+  log_sigma_theta ~ dnorm(0, pow(0.35, -2))
+  sigma_theta <- exp(log_sigma_theta)
+  
+  mu_log_sigma.eta ~ dnorm(-3,1) # center arround exp(-3)=0.05
+  log_sigma_log_sigma.eta ~ dnorm(-0.7, pow(0.35, -2)) # mean exp(-0.7)=0.50, sdlog=0.35
+  sigma_log_sigma.eta <- exp(log_sigma_log_sigma.eta)
+  
+  mu_log_sigma ~ dnorm(-1.9, 1) # exp(-1.9)=0.15
+  log_sigma_log_sigma ~ dnorm(-0.7, pow(0.35, -2))
+  sigma_log_sigma <- exp(log_sigma_log_sigma)
+  
+}
+"
+```
+
+Train model and traceplot.
+```{r}
+Iter <- 10000
+Burn <- 5000
+Chain <- 3
+Thin <- 25
+
+gparameters <- c("mu", "tau", "sigma.eta", "sigma", "theta", "x",
+                 "mu_theta", "sigma_theta",
+                 "mu_log_sigma.eta", "sigma_log_sigma.eta", 
+                 "mu_log_sigma", "sigma_log_sigma", "eps")
+data <- list(y=y, n=n, M=M, N=N)
+general_model <-jags(data, parameters.to.save=gparameters,
+ 		   model=textConnection(BUGS.general_model),
+		   n.iter=(Iter*Thin+Burn),n.burnin=Burn, n.thin=Thin, n.chains=Chain)
+
+
+traceplot(general_model , mfrow = c(2,2), varname = c("mu", "sigma", "sigma.eta", "theta", "mu_theta", "sigma_theta", "mu_log_sigma.eta", "sigma_log_sigma.eta", "mu_log_sigma", "sigma_log_sigma"))
+```
+
+Save parameters and show its summary.
+```{r}
+attach.jags(general_model)
+gmu <- mu
+colnames(gmu) <- colnames(C2)
+gsigma <- sigma
+gsigma.eta <- sigma.eta
+gtheta <- theta
+gx <- x
+mu_theta <- mu_theta
+sigma_theta <- sigma_theta
+mu_log_sigma.eta<-mu_log_sigma.eta
+sigma_log_sigma.eta<-sigma_log_sigma.eta
+mu_log_sigma<-mu_log_sigma
+sigma_log_sigma<-sigma_log_sigma
+geps <- eps
+detach.jags()
+
+summary(gmu)
+summary(gsigma)
+summary(gsigma.eta)
+summary(gtheta)
+summary(gx)
+summary(mu_theta)
+summary(sigma_theta)
+summary(mu_log_sigma.eta)
+summary(sigma_log_sigma.eta)
+summary(mu_log_sigma)
+summary(sigma_log_sigma)
+summary(geps)
+```
+
+### Hierarchical sigma model
+
+A model with single $\theta$ and $\sigma_\eta$ but hierarchical $\sigma$.
+```{r}
+BUGS.Hsigma_model <- "
+model
+{
+  for (j in 1:M){
+    
+    # hidden state
+    x[1,j] <- mu[j] + eps[1,j]*sigma.eta
+    eps[1,j] ~ dnorm(0,1)
+    for (t in 2:N){
+      x[t,j] <- (1-theta)*mu[j] + theta*x[t-1,j] + sigma.eta*eps[t,j]
+      eps[t,j] ~ dnorm(0,1)
+    }
+    
+    # observed
+    for (t in 1:N){
+      y[t,j] ~ dnorm(x[t,j], tau[j]*n[t,j])
+    }
+    
+    mu_aux[j] ~ dbeta(1,1) # in (0,1)
+    mu[j] <- 2*mu_aux[j]-1 # in (-1,1)
+  }
+  
+  for (j in 1:M){
+    # SD obs
+    log_sigma[j] ~ dnorm(mu_log_sigma, pow(sigma_log_sigma, -2))
+    sigma[j] <- exp(log_sigma[j])
+    tau[j] <- pow(sigma[j], -2)
+  }
+  theta_aux ~ dnorm(mu_theta, pow(sigma_theta, -2))
+  theta <- 1 / (1 + exp(-theta_aux))
+  
+  # Lognormal distributions for the sd
+  # SD dynamic
+  log_sigma.eta ~ dnorm(mu_log_sigma.eta, pow(sigma_log_sigma.eta, -2))
+  sigma.eta <- exp(log_sigma.eta)
+  tau.eta <- pow(sigma.eta, -2)
+  
+  mu_theta ~ dnorm(0,1)
+  log_sigma_theta ~ dnorm(0, pow(0.35, -2))
+  sigma_theta <- exp(log_sigma_theta)
+  
+  mu_log_sigma.eta ~ dnorm(-3, 1) # center arround exp(-3)=0.05
+  log_sigma_log_sigma.eta ~ dnorm(-0.7, pow(0.35, -2)) # mean exp(-0.7)=0.50, sdlog=0.35
+  sigma_log_sigma.eta <- exp(log_sigma_log_sigma.eta)
+  
+  mu_log_sigma ~ dnorm(-1.9, 1) # exp(-1.9)=0.15
+  log_sigma_log_sigma ~ dnorm(-0.7, pow(0.35, -2))
+  sigma_log_sigma <- exp(log_sigma_log_sigma)
+  
+}
+"
+```
+
+Train model and traceplot.
+```{r}
+Hsigma_model <-jags(data, parameters.to.save=gparameters,
+ 		   model=textConnection(BUGS.Hsigma_model),
+		   n.iter=(Iter*Thin+Burn),n.burnin=Burn, n.thin=Thin, n.chains=Chain)
+
+
+traceplot(Hsigma_model , mfrow = c(2,2), varname = c("mu", "sigma", "sigma.eta", "theta", "mu_theta", "sigma_theta", 
+"mu_log_sigma.eta", "sigma_log_sigma.eta", 
+"mu_log_sigma", "sigma_log_sigma"))
+```
+
+Save parameters and show its summary.
+```{r}
+attach.jags(Hsigma_model)
+hsmu <- mu
+colnames(hsmu) <- colnames(C2)
+hssigma <- sigma
+hssigma.eta <- sigma.eta
+hstheta <- theta
+hsx <- x
+hsmu_theta <- mu_theta
+hssigma_theta <- sigma_theta
+hsmu_log_sigma.eta<-mu_log_sigma.eta
+hssigma_log_sigma.eta<-sigma_log_sigma.eta
+hsmu_log_sigma<-mu_log_sigma
+hssigma_log_sigma<-sigma_log_sigma
+hseps <- eps
+detach.jags()
+```
+
+## Model evaluation and diagnostics
+
+Densities for the posterior distributions of the hierarchical hyperparameters (general model).
+```{r}
+plot_density <- function(samples, name) {
+  df <- data.frame(value = samples)
+  
+  ggplot(df, aes(x = value)) +
+    geom_density(fill = "steelblue", alpha = 0.5, linewidth = 0.8) +
+    labs(
+      title = paste("Posterior density of", name),
+      x = name,
+      y = "Density"
+    ) +
+    theme_minimal()
+}
+
+plot_group_density <- function(samples, name, group_labels = NULL) {
+  # samples: matrix/data.frame, columns = groups (k)
+  samples <- as.data.frame(samples)
+  
+  # if lables in args, we use them
+  if (!is.null(group_labels)) {
+    if (length(group_labels) != ncol(samples)) {
+      stop("length(group_labels) must match ncol(samples)")
+    }
+    colnames(samples) <- group_labels
+  }
+  
+  df <- samples |>
+    mutate(iter = dplyr::row_number()) |>
+    pivot_longer(
+      cols      = -iter,
+      names_to  = "group",
+      values_to = "value"
+    )
+  
+  ggplot(df, aes(x = value, color = group, fill = group)) +
+    geom_density(alpha = 0.25, linewidth = 0.8) +
+    labs(
+      title = paste("Posterior density of", name, "by group"),
+      x     = name,
+      y     = "Density",
+      color = "Group",
+      fill  = "Group"
+    ) +
+    theme_minimal()
+}
+
+par(mfrow = c(2, 1))
+plot_density(mu_theta, name = "mu_theta")
+plot_density(sigma_theta, name = "sigma_theta")
+
+par(mfrow = c(2, 1))
+plot_density(mu_log_sigma.eta, name = "mu_log_sigma.eta")
+plot_density(sigma_log_sigma.eta, name = "sigma_log_sigma.eta")
+
+par(mfrow = c(2, 1))
+plot_density(mu_log_sigma, name = "mu_log_sigma")
+plot_density(sigma_log_sigma, name = "sigma_log_sigma")
+
+```
+Exploratory residual diagnostic: we plot the difference between the posterior mean of the latent state (x_post_mean) and the observed aggregated score (y) against the effective information mass n. Under the observation model, residual dispersion should decrease as n increases (heteroskedasticity driven by 1/n).
+
+Standardized residuals (informal check): we rescale residuals by sqrt(n) and the posterior mean observation-noise scale so that, under the Gaussian observation model, they are approximately N(0, 1). The histogram provides a quick check for heavy tails or skewness. The Shapiro–Wilk p-value is reported only as a descriptive summary (residuals are not strictly i.i.d. due to latent-state estimation and temporal dependence).
+
+This is a quick visual check. Formal model assessment is performed later with posterior predictive checks (PPC).
+```{r}
+par(mfrow = c(2, 3))
+x_post_mean <- apply(general_model$BUGSoutput$sims.list$x, c(2, 3), mean) # gx mean
+res <- matrix(nrow=N,ncol=M)
+for (j in 1:M){
+  # |res| decreases as n increases
+  res[, j] <- x_post_mean[, j]-y[, j]
+  plot(n[,j],res[,j])
+  abline(h=0)
+}
+
+for (j in 1:M){
+  # sqrt(n)*(x-y)/sigma ~ N(0,1) ?
+  standarized_res <- sqrt(n[,j])*res[,j]/mean(gsigma[,j])
+  p_shapiro <- round(shapiro.test(standarized_res)$p.value,3)
+  
+  hist(standarized_res, breaks=15, xlab="standardized residuals", 
+       main=paste0(colnames(y)[j], "\n(shapiro test p-value: ", p_shapiro,")"))
+}
+
+
+```
+PPC tools for R2jags output
+```{r}
+# Extract draws from R2jags fit
+extract_draws_r2jags <- function(fit, y, n, max_draws = 2000, seed = 1) {
+  set.seed(seed)
+
+  mat_all <- fit$BUGSoutput$sims.matrix
+  if (is.null(mat_all)) stop("fit$BUGSoutput$sims.matrix not found.")
+
+  S_all <- nrow(mat_all)
+  S <- min(max_draws, S_all)
+  idx_s <- sample.int(S_all, S, replace = FALSE)
+  mat <- mat_all[idx_s, , drop = FALSE]
+
+  N <- nrow(y); M <- ncol(y)
+  
+  # x_draws: S x N x M
+  x_draws <- array(NA_real_, dim = c(S, N, M))
+  for (j in 1:M) {
+    for (t in 1:N) {
+      nm <- paste0("x[", t, ",", j, "]")
+      if (!nm %in% colnames(mat)) stop("Missing in sims.matrix: ", nm)
+      x_draws[, t, j] <- mat[, nm]
+    }
+  }
+
+  # sigma_draws: S x M (prefer sigma[j], else tau[j])
+  sigma_draws <- matrix(NA_real_, nrow = S, ncol = M)
+  has_sigma <- all(paste0("sigma[", 1:M, "]") %in% colnames(mat))
+  has_tau   <- all(paste0("tau[",   1:M, "]") %in% colnames(mat))
+
+  if (has_sigma) {
+    for (j in 1:M) sigma_draws[, j] <- mat[, paste0("sigma[", j, "]")]
+  } else if (has_tau) {
+    for (j in 1:M) sigma_draws[, j] <- 1 / sqrt(mat[, paste0("tau[", j, "]")])
+  } else {
+    stop("Need either sigma[j] or tau[j] monitored.")
+  }
+
+  # Optional: theta, mu, sigma.eta (needed for forward PPC)
+  theta_draws <- NULL; mu_draws <- NULL; sigma_eta_draws <- NULL
+
+  if (all(paste0("theta[", 1:M, "]") %in% colnames(mat))) {
+    theta_draws <- matrix(NA_real_, nrow = S, ncol = M)
+    for (j in 1:M) theta_draws[, j] <- mat[, paste0("theta[", j, "]")]
+  }
+
+  if (all(paste0("mu[", 1:M, "]") %in% colnames(mat))) {
+    mu_draws <- matrix(NA_real_, nrow = S, ncol = M)
+    for (j in 1:M) mu_draws[, j] <- mat[, paste0("mu[", j, "]")]
+  }
+
+  has_sigma_eta <- all(paste0("sigma.eta[", 1:M, "]") %in% colnames(mat))
+  has_tau_eta   <- all(paste0("tau.eta[",   1:M, "]") %in% colnames(mat))
+  if (has_sigma_eta) {
+    sigma_eta_draws <- matrix(NA_real_, nrow = S, ncol = M)
+    for (j in 1:M) sigma_eta_draws[, j] <- mat[, paste0("sigma.eta[", j, "]")]
+  } else if (has_tau_eta) {
+    sigma_eta_draws <- matrix(NA_real_, nrow = S, ncol = M)
+    for (j in 1:M) sigma_eta_draws[, j] <- 1 / sqrt(mat[, paste0("tau.eta[", j, "]")])
+  }
+
+  list(
+    mat = mat,
+    x_draws = x_draws,
+    sigma_draws = sigma_draws,
+    theta_draws = theta_draws,
+    mu_draws = mu_draws,
+    sigma_eta_draws = sigma_eta_draws
+  )
+}
+
+# PPC for one category
+ppc_category <- function(y, n, draws, j,
+                         type = c("total", "conditional", "forward"),
+                         nsim = 500,
+                         level1 = 0.80, level2 = 0.95,
+                         seed = 1, main = NULL, eps = 1e-8) {
+
+  set.seed(seed)
+  type <- match.arg(type)
+
+  N <- nrow(y)
+  x_draws <- draws$x_draws
+  sigma_draws <- draws$sigma_draws
+  S <- dim(x_draws)[1]
+
+  idx <- which(!is.na(y[, j]) & is.finite(n[, j]) & n[, j] > 0)
+  if (length(idx) < 3) stop("Too few observations for this category.")
+
+  sims <- sample.int(S, size = min(nsim, S), replace = FALSE)
+  yrep <- matrix(NA_real_, nrow = length(sims), ncol = length(idx))
+
+  if (type == "conditional") {
+    x_hat <- apply(x_draws[, , j, drop = FALSE], 2, median)  # length N
+  }
+
+  if (type %in% c("total", "conditional")) {
+    for (k in seq_along(sims)) {
+      s <- sims[k]
+      mu_t <- if (type == "total") x_draws[s, idx, j] else x_hat[idx]
+      sd_t <- sigma_draws[s, j] / sqrt(pmax(n[idx, j], eps))
+      yrep[k, ] <- rnorm(length(idx), mean = mu_t, sd = sd_t)
+    }
+  }
+
+  if (type == "forward") {
+    if (is.null(draws$theta_draws) || is.null(draws$mu_draws) || is.null(draws$sigma_eta_draws)) {
+      stop("Forward PPC needs theta[j], mu[j], and sigma.eta[j] (or tau.eta[j]) monitored.")
+    }
+    theta_draws <- draws$theta_draws
+    mu_draws <- draws$mu_draws
+    sigma_eta_draws <- draws$sigma_eta_draws
+
+    for (k in seq_along(sims)) {
+      s <- sims[k]
+      theta <- theta_draws[s, j]
+      muj <- mu_draws[s, j]
+      sd_eta <- sigma_eta_draws[s, j]
+      sd_obs <- sigma_draws[s, j]
+
+      xrep <- numeric(N)
+      xrep[1] <- rnorm(1, mean = muj, sd = sd_eta)
+      for (t in 2:N) {
+        mean_t <- (1 - theta) * muj + theta * xrep[t - 1]
+        xrep[t] <- rnorm(1, mean = mean_t, sd = sd_eta)
+      }
+
+      sd_t <- sd_obs / sqrt(pmax(n[idx, j], eps))
+      yrep[k, ] <- rnorm(length(idx), mean = xrep[idx], sd = sd_t)
+    }
+  }
+
+  # Out-of-range metrics for sentiment bounded in [-1,1]
+  out_mat <- (yrep < -1) | (yrep > 1)
+  p_out_mean   <- mean(out_mat)                 # overall fraction out of range
+  p_out_any    <- mean(rowSums(out_mat) > 0)    # P(any out-of-range point in a replicate)
+  p_out_max_t  <- max(colMeans(out_mat))        # worst time point (max over t of P(out))
+
+  q_lo1 <- (1 - level1) / 2; q_hi1 <- 1 - q_lo1
+  q_lo2 <- (1 - level2) / 2; q_hi2 <- 1 - q_lo2
+
+  band <- data.frame(
+    t = idx,
+    y = y[idx, j],
+    med = apply(yrep, 2, median),
+    lo1 = apply(yrep, 2, quantile, probs = q_lo1),
+    hi1 = apply(yrep, 2, quantile, probs = q_hi1),
+    lo2 = apply(yrep, 2, quantile, probs = q_lo2),
+    hi2 = apply(yrep, 2, quantile, probs = q_hi2)
+  )
+
+  cover1 <- mean(band$y >= band$lo1 & band$y <= band$hi1)
+  cover2 <- mean(band$y >= band$lo2 & band$y <= band$hi2)
+
+  obs_mean <- mean(band$y)
+  rep_mean <- rowMeans(yrep)
+  p_mean <- mean(rep_mean >= obs_mean)
+
+  if (is.null(main)) main <- paste0("PPC (", type, ") j=", j)
+
+  plot(band$t, band$y, type = "p", pch = 16,
+       xlab = "t", ylab = "y", main = main)
+
+  polygon(c(band$t, rev(band$t)), c(band$lo2, rev(band$hi2)),
+          border = NA, col = rgb(0, 0, 0, 0.08))
+  polygon(c(band$t, rev(band$t)), c(band$lo1, rev(band$hi1)),
+          border = NA, col = rgb(0, 0, 0, 0.15))
+  lines(band$t, band$med, lwd = 2)
+  points(band$t, band$y, pch = 16)
+
+  invisible(list(
+    band = band,
+    cover80 = cover1,
+    cover95 = cover2,
+    p_mean = p_mean,
+    p_out_mean = p_out_mean,
+    p_out_any = p_out_any,
+    p_out_max_t = p_out_max_t
+  ))
+}
+
+# PPC for all categories
+ppc_all_r2jags <- function(fit, y, n,
+                           category_names = colnames(y),
+                           type = c("total", "conditional", "forward"),
+                           nsim = 500, max_draws = 2000, seed = 1) {
+  type <- match.arg(type)
+  if (is.null(category_names)) category_names <- paste0("cat_", 1:ncol(y))
+
+  draws <- extract_draws_r2jags(fit, y, n, max_draws = max_draws, seed = seed)
+
+  M <- ncol(y)
+  oldpar <- par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  par(mfrow = c(ceiling(M/2), 2), mar = c(3,3,2,1))
+
+  out <- vector("list", M)
+  for (j in 1:M) {
+    out[[j]] <- ppc_category(y, n, draws, j, type = type, nsim = nsim, seed = seed,
+                             main = category_names[j])
+  }
+
+  summary <- data.frame(
+    category = category_names,
+    cover80 = sapply(out, `[[`, "cover80"),
+    cover95 = sapply(out, `[[`, "cover95"),
+    p_mean  = sapply(out, `[[`, "p_mean"),
+    p_out_mean = sapply(out, `[[`, "p_out_mean"),
+    p_out_any  = sapply(out, `[[`, "p_out_any"),
+    p_out_max_t = sapply(out, `[[`, "p_out_max_t")
+  )
+
+  list(results = out, summary = summary, draws = draws)
+}
+
+res_total <- ppc_all_r2jags(general_model, y, n, type="total")
+res_total$summary
+
+res_cond  <- ppc_all_r2jags(general_model, y, n, type="conditional")
+res_cond$summary
+
+res_fwd   <- ppc_all_r2jags(general_model, y, n, type="forward")
+res_fwd$summary
+
+```
+```{r}
+setwd("/home/ian/Projects/BayesianNewsSentiment/")
+# ESSENTIAL FIGURES
+
+# CATEGORY LABELS
+LABELS <- c(
+  "economics, finance and markets",
+  "corporate, business, industry and innovation",
+  "technology, ai and digital platforms",
+  "geopolitics, war, security and international relations",
+  "domestic politics, elections and government",
+  "energy, commodities and environment",
+  "society, human rights and public health",
+  "sports, entertainment and culture"
+)
+
+# make labels match M
+labels_M <- LABELS[seq_len(M)]
+
+# friendly label formatter (optional)
+pretty_lab <- function(x) str_to_title(x)
+
+make_df_param <- function(simple_vec, complex_mat, param_name) {
+  stopifnot(ncol(complex_mat) == length(labels_M))
+  colnames(complex_mat) <- labels_M
+
+  df_simple <- tibble(
+    value = simple_vec,
+    category = "pooled",
+    model = "simple"
+  )
+
+  df_complex <- as_tibble(complex_mat) %>%
+    mutate(iter = row_number()) %>%
+    pivot_longer(-iter, names_to = "category", values_to = "value") %>%
+    mutate(model = "complex") %>%
+    select(-iter)
+
+  df <- bind_rows(df_simple, df_complex) %>%
+    mutate(
+      category = factor(category, levels = c("pooled", labels_M)),
+      model = factor(model, levels = c("simple", "complex"))
+    )
+
+  attr(df, "param_name") <- param_name
+  df
+}
+
+plot_param_densities <- function(df_param, p_lower = 0.01, p_upper = 0.99) {
+  param_name <- attr(df_param, "param_name")
+
+  x_min <- quantile(df_param$value, probs = p_lower, na.rm = TRUE)
+  x_max <- quantile(df_param$value, probs = p_upper, na.rm = TRUE)
+
+  ggplot() +
+    geom_density(
+      data = df_param %>% filter(model == "simple"),
+      aes(x = value),
+      color = "black",
+      linewidth = 1.0
+    ) +
+    geom_density(
+      data = df_param %>% filter(model == "complex"),
+      aes(x = value, color = category),
+      linewidth = 0.7,
+      alpha = 0.9
+    ) +
+    coord_cartesian(xlim = c(x_min, x_max)) +
+    labs(
+      x = param_name,
+      y = "Density",
+      color = "Category",
+      #title = paste0("Posterior densities for ", param_name),
+      #subtitle = "Black: pooled (simple). Colors: category-specific (complex)."
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+# --- FIGURE 1: THETA DENSITIES ---
+# expect: stheta (vector), gtheta (iter x M)
+df_theta <- make_df_param(stheta, gtheta, param_name = expression(theta[j]))
+p_theta <- plot_param_densities(df_theta, p_lower = 0.001, p_upper = 0.999)
+
+# --- FIGURE 2: SIGMA + SIGMA_ETA DENSITIES ---
+# expect: ssigma, gsigma ; ssigma.eta, gsigma.eta
+df_sigma <- make_df_param(ssigma, gsigma, param_name = expression(sigma[j]))
+p_sigma <- plot_param_densities(df_sigma, p_lower = 0.001, p_upper = 0.999)
+
+df_sigma_eta <- make_df_param(ssigma.eta, gsigma.eta, param_name = expression(sigma[eta*j]))
+p_sigma_eta <- plot_param_densities(df_sigma_eta, p_lower = 0.001, p_upper = 0.999)
+
+# --- FIGURE 3: OBSERVED y vs LATENT x (with uncertainty band) ---
+# x_draws: array [iter, t, j]
+x_draws <- general_model$BUGSoutput$sims.list$x
+stopifnot(dim(x_draws)[2] == N, dim(x_draws)[3] == M)
+
+x_mean <- apply(x_draws, c(2, 3), mean)
+x_q05  <- apply(x_draws, c(2, 3), quantile, probs = 0.05)
+x_q95  <- apply(x_draws, c(2, 3), quantile, probs = 0.95)
+
+df_yx <- tibble(
+  t = rep(seq_len(N), times = M),
+  category = rep(labels_M, each = N),
+  y = as.vector(y),
+  x_mean = as.vector(x_mean),
+  x_lo = as.vector(x_q05),
+  x_hi = as.vector(x_q95)
+) %>%
+  mutate(category = factor(category, levels = labels_M))
+
+LABELS_RAW <- c(
+  "economics, finance and markets",
+  "corporate, business, industry and innovation",
+  "technology, ai and digital platforms",
+  "geopolitics, war, security and international relations",
+  "domestic politics, elections and government",
+  "energy, commodities and environment",
+  "society, human rights and public health",
+  "sports, entertainment and culture"
+)
+
+LABELS_PRETTY <- LABELS_RAW
+LABELS_PRETTY[4] <- "geopolitics, war, security\nand international relations"
+
+pretty_map <- setNames(LABELS_PRETTY[seq_len(ncol(y))], labels_M)
+p_yx <- ggplot(df_yx, aes(x = t)) +
+  geom_ribbon(aes(ymin = x_lo, ymax = x_hi), alpha = 0.20) +
+  geom_line(aes(y = x_mean), linewidth = 0.8) +
+  geom_point(aes(y = y), size = 1.2, shape = 1) +
+  #geom_line(aes(y = y), linetype = "dashed", linewidth = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  facet_wrap(~ category, scales = "free_y", ncol=2, labeller = labeller(category = pretty_map)) +
+  labs(
+    x = "Time window (t)",
+    y = "Sentiment",
+    #title = "Observed aggregated sentiment vs latent sentiment",
+    #subtitle = "Solid line: posterior mean of x(t,j) with 90% credible band. Points: observed values y(t,j)."
+  ) +
+  theme_minimal(base_size = 12)
+
+# SAVE FIGURES
+dir.create("figures", showWarnings = FALSE)
+
+ggsave("figures/fig_theta_densities.pdf", p_theta, width = 8.5, height = 5.5, device = cairo_pdf)
+ggsave("figures/fig_sigma_densities.pdf", p_sigma, width = 8.5, height = 5.5, device = cairo_pdf)
+ggsave("figures/fig_sigma_eta_densities.pdf", p_sigma_eta, width = 8.5, height = 5.5, device = cairo_pdf)
+
+ggsave("figures/fig_y_vs_x.pdf", p_yx, width = 10.5, height = 6.5, device = cairo_pdf)
+
+# PRINT
+p_theta
+p_sigma
+p_sigma_eta
+p_yx
+
+```
+Visualize in the same plot $y_{tj}$ and its corresponding $n_{tj}$ in order to see the effective weight evolution (Y axis only shows $y_{tj}$ values).
+```{r}
+use_dates <- exists("week_date") && length(week_date) == N
+
+df_long <- tibble(
+  t        = rep(seq_len(N), times = M),
+  x        = if (use_dates) rep(week_date, times = M) else rep(seq_len(N), times = M),
+  category = rep(labels_M, each = N),
+  y        = as.vector(as.matrix(y)),
+  n        = as.vector(as.matrix(n))
+) %>%
+  mutate(
+    category = factor(category, levels = labels_M)  # SAME ORDER AS p_yx
+  )
+
+# fixed y-range
+ymin <- -0.7
+ymax <-  0.5
+yrng <- ymax - ymin
+
+# robust rescale of n (cap at p99)
+n_cap_val <- quantile(df_long$n, probs = 0.99, na.rm = TRUE)
+
+df_long <- df_long %>%
+  mutate(
+    n_cap = pmin(n, n_cap_val),
+    n01   = ifelse(is.finite(n_cap) & n_cap > 0, n_cap / max(n_cap, na.rm = TRUE), 0)
+  )
+
+# visual bar height inside each panel
+bar_frac   <- 0.95
+bar_height <- yrng * bar_frac
+
+df_long <- df_long %>%
+  mutate(bar_top = ymin + n01 * bar_height)
+
+# Compute the max lim for X axis
+# we use pull() to extract the max value of the x column
+xmax_data <- df_long %>% 
+  pull(x) %>% 
+  max(na.rm = TRUE)
+
+# define upper lim of X axis with a small margin (optional)
+# if x is an arrow, margin of 1 day is good
+# if x is an idx of time, margin of 1.5 is good
+x_margin <- ifelse(use_dates, 1, 1.5) 
+xmax_plot <- xmax_data + x_margin
+
+p_y_n <- ggplot(df_long, aes(x = x)) +
+  geom_linerange(
+    aes(ymin = ymin, ymax = bar_top),
+    color = "grey60", alpha = 0.5, linewidth = 1.4
+  ) +
+  geom_line(aes(y = y), linewidth = 0.9, color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~ category, ncol = 2, labeller = labeller(category = pretty_map), drop = FALSE) +   # keeps the order and panels
+  coord_cartesian(ylim = c(ymin, ymax), xlim = c(min(df_long$x, na.rm = TRUE), xmax_plot)) +
+  labs(
+    x = if (use_dates) "Week" else "Time window (t)",
+    y = "Aggregated sentiment (y)",
+    #subtitle = "Line: y(t,j) with fixed y-scale. Bars: n(t,j) rescaled globally for visual comparison."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# if x type is Date
+p_y_n <- p_y_n + 
+  scale_x_date(
+    # lims, max_data are computed as above
+    limits = c(min(df_long$x, na.rm = TRUE), xmax_plot), 
+    # format and breaks (for better ) (for better readability)
+    breaks = scales::date_breaks("5 months"), 
+    labels = scales::date_format("%Y-%m")
+  )
+p_y_n
+
+ggsave("figures/fig_exploratory.pdf", p_y_n, width = 10.5, height = 7.5, device = cairo_pdf)
+
+```
+
+## Additional
+
+One plot to compare $y_{tj}$ across categories and another for $n_{tj}$.
+```{r}
+start_date <- as.Date("2024-01-01")
+end_date   <- as.Date("2024-12-05")
+
+# week associated to each t (start of each week)
+week_date <- seq.Date(from = start_date, by = "7 days", length.out = N)
+
+df_y <- as.data.frame(y) %>%
+  mutate(date = week_date) %>%
+  pivot_longer(cols = -date, names_to = "category", values_to = "y")
+
+p_y <- ggplot(df_y, aes(x = date, y = y, color = category)) +
+  geom_line(linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Week",
+    y = "Aggregated sentiment (y_tj)",
+    color = "Category",
+    title = "Aggregated sentiment by category (weekly)"
+  ) +
+  theme_minimal()
+
+p_y
+
+df_n <- as.data.frame(n) %>%
+  mutate(date = week_date) %>%
+  pivot_longer(cols = -date, names_to = "category", values_to = "n")
+
+p_n <- ggplot(df_n, aes(x = date, y = n, color = category)) +
+  geom_line(linewidth = 0.7) +
+  labs(
+    x = "Week",
+    y = "Effective category weight (n_tj)",
+    color = "Category",
+    title = "Effective category weight by category (weekly)"
+  ) +
+  theme_minimal()
+
+p_n
+
+```
+
+MCMC traceplots for concrete parametrs.
+```{r}
+m <- as.mcmc(general_model)      # m is an mcmc.list
+vn <- varnames(m)                # exact available names
+head(vn, 30)
+
+n_eff_j <- colSums(n)
+j_hi <- which.max(n_eff_j)
+
+j_lo <- which(n_eff_j == min(n_eff_j[n_eff_j > 0]))[1]
+j_rep <- c(j_hi, j_lo)
+j_rep
+
+vars_min <- c(
+  paste0("theta[", j_rep, "]"),
+  paste0("sigma[", j_rep, "]"),
+  paste0("sigma.eta[", j_rep, "]")
+)
+
+# check they exist in the object
+vars_min <- vars_min[vars_min %in% varnames(m)]
+vars_min
+
+par(mfrow = c(3, 2), mar = c(3, 3, 2, 1))
+coda::traceplot(m[, vars_min, drop = FALSE])
+png("/home/ian/Projects/BayesianNewsSentiment/figures/traceplots.png", width = 1600, height = 1200, res = 150)
+par(mfrow = c(3, 2), mar = c(3, 3, 2, 1))
+coda::traceplot(m[, vars_min, drop = FALSE])
+dev.off()
+```
