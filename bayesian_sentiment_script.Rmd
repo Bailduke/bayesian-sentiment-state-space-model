@@ -156,6 +156,7 @@ C2 <- as.data.frame(C) %>% select(-categories_to_delete)
 C2 <- as.matrix(C2)
 M <- ncol(C2)
 attach(df)
+N <- max(temporal_id)
 n <- matrix(nrow=N,ncol=M)
 colnames(n) <- colnames(C2)
 y <- matrix(nrow=N,ncol=M)
@@ -164,7 +165,6 @@ for (t in 1:N) {
   idx <- temporal_id==t
   Ct <- C2[idx,]
   post <- positive[idx]
-  neut <-neutral[idx]
   negt <- negative[idx]
   St <- (post-negt)
   for (j in 1:M){
@@ -186,9 +186,9 @@ df_y <- as.data.frame(y) %>%
     values_to = "sentiment"
   )
 
-#df_y <- df_y[df_y$t <= 50,] # to just visualize until 50th week
+#df_y <- df_y[df_y$t <= 50,]
 
-# plot of sentiment evolution per category
+# Plot of sentiment evolution per category
 ggplot(df_y, aes(x = t, y = sentiment, color = category)) +
   geom_line(linewidth = 0.7) +
   geom_hline(yintercept = 0, linetype = "dashed") +
@@ -200,13 +200,16 @@ ggplot(df_y, aes(x = t, y = sentiment, color = category)) +
   ) +
   ylim(-0.7,0.5) +
   theme_minimal()
-
 ```
 
 ## Models
 
 The paper reports results from the hierarchical model (partial pooling across categories) [general model]. The simple and intermediate specifications are included for comparison.
 
+We initially specified the initial state as `x[1,j] ~ dnorm(mu[j], tau.eta[j])`. In practice, this centered parameterization led to slow mixing and occasional multimodal-looking trace behavior in preliminary runs. 
+To improve MCMC efficiency, we therefore use a non-centered parameterization for the latent state:
+`x[1,j] <- mu[j] + eps[1,j] * sigma.eta[j]`, with `eps[1,j] ~ dnorm(0,1)`. This reparameterization is 
+mathematically equivalent but typically samples more efficiently in hierarchical state-space models.
 
 ### Simple Model
 
@@ -323,12 +326,10 @@ model
   for (j in 1:M){
     
     # hidden state
-    #x[1,j] ~ dnorm(mu[j], tau.eta[j])
     x[1,j] <- mu[j] + eps[1,j]*sigma.eta[j]
     eps[1,j] ~ dnorm(0,1)
     for (t in 2:N){
       x[t,j] <- (1-theta[j])*mu[j] + theta[j]*x[t-1,j]+ sigma.eta[j]*eps[t,j]
-      #x[t,j] ~ dnorm((1-theta[j])*mu[j] + theta[j]*x[t-1,j], tau.eta[j])
       eps[t,j] ~ dnorm(0,1)
     }
     
@@ -339,7 +340,6 @@ model
     
     mu_aux[j] ~ dbeta(1,1) # in (0,1)
     mu[j] <- 2*mu_aux[j]-1 # in (-1,1)
-    #theta[j] ~ dbeta(1,1)
   }
   
   for (j in 1:M){
@@ -376,11 +376,6 @@ model
 
 Train model and traceplot.
 ```{r}
-Iter <- 10000
-Burn <- 5000
-Chain <- 3
-Thin <- 25
-
 gparameters <- c("mu", "tau", "sigma.eta", "sigma", "theta", "x",
                  "mu_theta", "sigma_theta",
                  "mu_log_sigma.eta", "sigma_log_sigma.eta", 
@@ -403,12 +398,12 @@ gsigma <- sigma
 gsigma.eta <- sigma.eta
 gtheta <- theta
 gx <- x
-mu_theta <- mu_theta
-sigma_theta <- sigma_theta
-mu_log_sigma.eta<-mu_log_sigma.eta
-sigma_log_sigma.eta<-sigma_log_sigma.eta
-mu_log_sigma<-mu_log_sigma
-sigma_log_sigma<-sigma_log_sigma
+gmu_theta <- mu_theta
+gsigma_theta <- sigma_theta
+gmu_log_sigma.eta<-mu_log_sigma.eta
+gsigma_log_sigma.eta<-sigma_log_sigma.eta
+gmu_log_sigma<-mu_log_sigma
+gsigma_log_sigma<-sigma_log_sigma
 geps <- eps
 detach.jags()
 
@@ -417,12 +412,12 @@ summary(gsigma)
 summary(gsigma.eta)
 summary(gtheta)
 summary(gx)
-summary(mu_theta)
-summary(sigma_theta)
-summary(mu_log_sigma.eta)
-summary(sigma_log_sigma.eta)
-summary(mu_log_sigma)
-summary(sigma_log_sigma)
+summary(gmu_theta)
+summary(gsigma_theta)
+summary(gmu_log_sigma.eta)
+summary(gsigma_log_sigma.eta)
+summary(gmu_log_sigma)
+summary(gsigma_log_sigma)
 summary(geps)
 ```
 
@@ -564,21 +559,21 @@ plot_group_density <- function(samples, name, group_labels = NULL) {
 }
 
 par(mfrow = c(2, 1))
-plot_density(mu_theta, name = "mu_theta")
-plot_density(sigma_theta, name = "sigma_theta")
+plot_density(gmu_theta, name = "mu_theta")
+plot_density(gsigma_theta, name = "sigma_theta")
 
 par(mfrow = c(2, 1))
-plot_density(mu_log_sigma.eta, name = "mu_log_sigma.eta")
-plot_density(sigma_log_sigma.eta, name = "sigma_log_sigma.eta")
+plot_density(gmu_log_sigma.eta, name = "mu_log_sigma.eta")
+plot_density(gsigma_log_sigma.eta, name = "sigma_log_sigma.eta")
 
 par(mfrow = c(2, 1))
-plot_density(mu_log_sigma, name = "mu_log_sigma")
-plot_density(sigma_log_sigma, name = "sigma_log_sigma")
+plot_density(gmu_log_sigma, name = "mu_log_sigma")
+plot_density(gsigma_log_sigma, name = "sigma_log_sigma")
 
 ```
-Exploratory residual diagnostic: we plot the difference between the posterior mean of the latent state (x_post_mean) and the observed aggregated score (y) against the effective information mass n. Under the observation model, residual dispersion should decrease as n increases (heteroskedasticity driven by 1/n).
+Exploratory residual diagnostic: we plot the difference between the posterior mean of the latent state ($x_post_mean$) and the observed aggregated score $y$ against the effective weight $n$. Under the observation model, residual dispersion should decrease as $n$ increases (heteroskedasticity driven by 1/$n$).
 
-Standardized residuals (informal check): we rescale residuals by sqrt(n) and the posterior mean observation-noise scale so that, under the Gaussian observation model, they are approximately N(0, 1). The histogram provides a quick check for heavy tails or skewness. The Shapiro–Wilk p-value is reported only as a descriptive summary (residuals are not strictly i.i.d. due to latent-state estimation and temporal dependence).
+Standardized residuals (informal check): we rescale residuals by $\sqrt {n}$ and the posterior mean observation-noise scale so that, under the Gaussian observation model, they are approximately N(0, 1). The histogram provides a quick check for heavy tails or skewness. The Shapiro–Wilk p-value is reported only as a descriptive summary (residuals are not strictly i.i.d. due to latent-state estimation and temporal dependence).
 
 This is a quick visual check. Formal model assessment is performed later with posterior predictive checks (PPC).
 ```{r}
@@ -605,6 +600,12 @@ for (j in 1:M){
 ```
 PPC tools for R2jags output
 ```{r}
+# Posterior predictive checks (PPC) and related diagnostics.
+# 'posterior' corresponds to the standard PPC (replicated y ~ p(y | x, sigma) with (x, sigma) drawn from the posterior).
+# 'conditional' fixes x to its posterior median to isolate the observation noise component.
+# 'forward' simulates x from the fitted state equation to assess whether the dynamic prior generates realistic trajectories.
+# Results reported in the paper correspond to the standard posterior PPC ('posterior').
+
 # Extract draws from R2jags fit
 extract_draws_r2jags <- function(fit, y, n, max_draws = 2000, seed = 1) {
   set.seed(seed)
@@ -642,7 +643,7 @@ extract_draws_r2jags <- function(fit, y, n, max_draws = 2000, seed = 1) {
     stop("Need either sigma[j] or tau[j] monitored.")
   }
 
-  # Optional: theta, mu, sigma.eta (needed for forward PPC)
+  # optional: theta, mu, sigma.eta (needed for forward PPC)
   theta_draws <- NULL; mu_draws <- NULL; sigma_eta_draws <- NULL
 
   if (all(paste0("theta[", 1:M, "]") %in% colnames(mat))) {
@@ -677,7 +678,7 @@ extract_draws_r2jags <- function(fit, y, n, max_draws = 2000, seed = 1) {
 
 # PPC for one category
 ppc_category <- function(y, n, draws, j,
-                         type = c("total", "conditional", "forward"),
+                         type = c("posterior", "conditional", "forward"),
                          nsim = 500,
                          level1 = 0.80, level2 = 0.95,
                          seed = 1, main = NULL, eps = 1e-8) {
@@ -700,10 +701,10 @@ ppc_category <- function(y, n, draws, j,
     x_hat <- apply(x_draws[, , j, drop = FALSE], 2, median)  # length N
   }
 
-  if (type %in% c("total", "conditional")) {
+  if (type %in% c("posterior", "conditional")) {
     for (k in seq_along(sims)) {
       s <- sims[k]
-      mu_t <- if (type == "total") x_draws[s, idx, j] else x_hat[idx]
+      mu_t <- if (type == "posterior") x_draws[s, idx, j] else x_hat[idx]
       sd_t <- sigma_draws[s, j] / sqrt(pmax(n[idx, j], eps))
       yrep[k, ] <- rnorm(length(idx), mean = mu_t, sd = sd_t)
     }
@@ -739,7 +740,6 @@ ppc_category <- function(y, n, draws, j,
   # Out-of-range metrics for sentiment bounded in [-1,1]
   out_mat <- (yrep < -1) | (yrep > 1)
   p_out_mean   <- mean(out_mat)                 # overall fraction out of range
-  p_out_any    <- mean(rowSums(out_mat) > 0)    # P(any out-of-range point in a replicate)
   p_out_max_t  <- max(colMeans(out_mat))        # worst time point (max over t of P(out))
 
   q_lo1 <- (1 - level1) / 2; q_hi1 <- 1 - q_lo1
@@ -780,7 +780,6 @@ ppc_category <- function(y, n, draws, j,
     cover95 = cover2,
     p_mean = p_mean,
     p_out_mean = p_out_mean,
-    p_out_any = p_out_any,
     p_out_max_t = p_out_max_t
   ))
 }
@@ -788,7 +787,7 @@ ppc_category <- function(y, n, draws, j,
 # PPC for all categories
 ppc_all_r2jags <- function(fit, y, n,
                            category_names = colnames(y),
-                           type = c("total", "conditional", "forward"),
+                           type = c("posterior", "conditional", "forward"),
                            nsim = 500, max_draws = 2000, seed = 1) {
   type <- match.arg(type)
   if (is.null(category_names)) category_names <- paste0("cat_", 1:ncol(y))
@@ -812,21 +811,22 @@ ppc_all_r2jags <- function(fit, y, n,
     cover95 = sapply(out, `[[`, "cover95"),
     p_mean  = sapply(out, `[[`, "p_mean"),
     p_out_mean = sapply(out, `[[`, "p_out_mean"),
-    p_out_any  = sapply(out, `[[`, "p_out_any"),
     p_out_max_t = sapply(out, `[[`, "p_out_max_t")
   )
 
   list(results = out, summary = summary, draws = draws)
 }
 
-res_total <- ppc_all_r2jags(general_model, y, n, type="total")
-res_total$summary
+res_ppc <- ppc_all_r2jags(general_model, y, n, type="posterior")
+res_ppc$summary
 
-res_cond  <- ppc_all_r2jags(general_model, y, n, type="conditional")
-res_cond$summary
+dir.create("tables", showWarnings = FALSE)
+saveRDS(res_ppc, "tables/res_ppc.rds")
+#res_cond  <- ppc_all_r2jags(general_model, y, n, type="conditional")
+#res_cond$summary
 
-res_fwd   <- ppc_all_r2jags(general_model, y, n, type="forward")
-res_fwd$summary
+#res_fwd   <- ppc_all_r2jags(general_model, y, n, type="forward")
+#res_fwd$summary
 
 ```
 ```{r}
@@ -846,7 +846,7 @@ LABELS <- c(
 )
 
 # make labels match M
-labels_M <- LABELS[seq_len(M)]
+labels_M <- LABELS[c(1,2,3,4,6,7)]
 
 # friendly label formatter (optional)
 pretty_lab <- function(x) str_to_title(x)
@@ -944,10 +944,10 @@ LABELS_RAW <- c(
   "corporate, business, industry and innovation",
   "technology, ai and digital platforms",
   "geopolitics, war, security and international relations",
-  "domestic politics, elections and government",
+  #"domestic politics, elections and government",
   "energy, commodities and environment",
-  "society, human rights and public health",
-  "sports, entertainment and culture"
+  "society, human rights and public health"
+  #"sports, entertainment and culture"
 )
 
 LABELS_PRETTY <- LABELS_RAW
@@ -987,11 +987,21 @@ p_yx
 ```
 Visualize in the same plot $y_{tj}$ and its corresponding $n_{tj}$ in order to see the effective weight evolution (Y axis only shows $y_{tj}$ values).
 ```{r}
-use_dates <- exists("week_date") && length(week_date) == N
+df <- df %>% mutate(temporal_id = temporal_id)
+# Map temporal_id -> week_start (or day) date
+df_time <- df %>%
+  distinct(temporal_id, week_start) %>%   # if time_mode == "week"
+  arrange(temporal_id)
+
+# Create a Date vector of length N with the start date of each time window
+x_dates <- as.Date(df_time$week_start)
+
+# sanity check
+stopifnot(length(x_dates) == N)
 
 df_long <- tibble(
   t        = rep(seq_len(N), times = M),
-  x        = if (use_dates) rep(week_date, times = M) else rep(seq_len(N), times = M),
+  x        = rep(x_dates, times = M),
   category = rep(labels_M, each = N),
   y        = as.vector(as.matrix(y)),
   n        = as.vector(as.matrix(n))
@@ -1030,7 +1040,7 @@ xmax_data <- df_long %>%
 # define upper lim of X axis with a small margin (optional)
 # if x is an arrow, margin of 1 day is good
 # if x is an idx of time, margin of 1.5 is good
-x_margin <- ifelse(use_dates, 1, 1.5) 
+x_margin <- 1 
 xmax_plot <- xmax_data + x_margin
 
 p_y_n <- ggplot(df_long, aes(x = x)) +
@@ -1043,7 +1053,7 @@ p_y_n <- ggplot(df_long, aes(x = x)) +
   facet_wrap(~ category, ncol = 2, labeller = labeller(category = pretty_map), drop = FALSE) +   # keeps the order and panels
   coord_cartesian(ylim = c(ymin, ymax), xlim = c(min(df_long$x, na.rm = TRUE), xmax_plot)) +
   labs(
-    x = if (use_dates) "Week" else "Time window (t)",
+    x = "Week",
     y = "Aggregated sentiment (y)",
     #subtitle = "Line: y(t,j) with fixed y-scale. Bars: n(t,j) rescaled globally for visual comparison."
   ) +
@@ -1066,6 +1076,8 @@ ggsave("figures/fig_exploratory.pdf", p_y_n, width = 10.5, height = 7.5, device 
 ```
 
 ## Additional
+
+### Extra plot
 
 One plot to compare $y_{tj}$ across categories and another for $n_{tj}$.
 ```{r}
@@ -1110,7 +1122,92 @@ p_n
 
 ```
 
-MCMC traceplots for concrete parametrs.
+### Bimodality and correlation check
+
+In Gaussian state-space models, persistence and variance parameters ($\theta$, $\sigma$, $\sigma_\eta$)can sometimes exhibit strong posterior correlations due to the standard observation-noise vs state-noise trade-off. In some datasets or model variants (especially under pooled specifications), this may also lead to bimodal marginal posteriors, reflecting multiple high-probability parameter regimes that provide similarly good fits.
+
+The following diagnostic code is included as a precautionary check to verify that posterior marginals are unimodal and
+consistent across chains, and to quantify posterior correlations between key parameters.
+
+In the current analysis, we do not observe problematic bimodality or unusually strong correlations, but these checks are
+kept for transparency and reproducibility.
+```{r}
+# Posterior densities by chain for key pooled parameters (theta, sigma, sigma.eta).
+# This is a precautionary diagnostic: in some datasets/model variants these parameters may show strong correlations
+# or apparent bimodality due to the observation-noise vs state-noise trade-off in state-space models.
+# Plotting densities by chain helps check whether any bimodality is consistent across chains (posterior feature)
+# or driven by chain-to-chain differences (potential convergence issue).
+density_by_chain <- function(param_m, param_name){
+  df_theta <- data.frame(
+    value = c(as.numeric(param_m[[1]]),
+              as.numeric(param_m[[2]]),
+              as.numeric(param_m[[3]])),
+    chain = factor(rep(1:3, times = sapply(param_m, length)))
+  )
+  
+  ggplot(df_theta, aes(x = value, color = chain)) +
+    geom_density(linewidth = 1.0) +
+    labs(
+      title = "Posterior density by chain",
+      x = param_name,
+      y = "Density",
+      color = "Chain"
+    ) +
+    theme_minimal()
+}
+m <- as.mcmc(simple_model)
+density_by_chain(m[, "theta"], "theta")
+density_by_chain(m[, "sigma"], "sigma")
+density_by_chain(m[, "sigma.eta"], "sigma.eta")
+
+# Correlation diagnostics:
+# - Simple (pooled) model: correlation matrix for (theta, sigma, sigma.eta).
+# - General (hierarchical) model: within-category correlations for the same parameters.
+# These summaries help quantify the strength of the posterior trade-off between observation noise and state innovation.
+
+# for the simple model: correlation matrix (pooled parameters)
+S_simple <- cbind(
+  theta     = stheta,
+  sigma     = ssigma,
+  sigma_eta = ssigma.eta
+)
+round(cor(S_simple, use = "complete.obs"), 3)
+
+# for the general model: correlation
+cor_by_category <- function(gtheta, gsigma, gsigma_eta, labels = NULL) {
+  M <- ncol(gtheta)
+  if (is.null(labels)) labels <- paste0("cat_", seq_len(M))
+  labels <- as.character(labels)
+
+  out <- data.frame(
+    category = labels,
+    cor_theta_sigma     = NA_real_,
+    cor_theta_sigma_eta = NA_real_,
+    cor_sigma_sigma_eta = NA_real_
+  )
+
+  for (j in 1:M) {
+    S <- cbind(
+      theta     = gtheta[, j],
+      sigma     = gsigma[, j],
+      sigma_eta = gsigma_eta[, j]
+    )
+    C <- cor(S, use = "complete.obs")
+    out$cor_theta_sigma[j]     <- C["theta", "sigma"]
+    out$cor_theta_sigma_eta[j] <- C["theta", "sigma_eta"]
+    out$cor_sigma_sigma_eta[j] <- C["sigma", "sigma_eta"]
+  }
+
+  out
+}
+
+cor_table <- cor_by_category(gtheta, gsigma, gsigma.eta, labels = labels_M)
+cor_table
+```
+
+### Some traceplots
+
+MCMC traceplots for concrete general model parameters.
 ```{r}
 m <- as.mcmc(general_model)      # m is an mcmc.list
 vn <- varnames(m)                # exact available names
