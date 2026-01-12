@@ -25,6 +25,9 @@ library(ggplot2)
 library(R2jags)
 library(coda)
 library(stringr)
+library(tibble)
+library(scales)
+library(broom)
 
 # to ensure consistent results across runs (reproducibility)
 set.seed(123)
@@ -507,8 +510,106 @@ hsmu_log_sigma<-mu_log_sigma
 hssigma_log_sigma<-sigma_log_sigma
 hseps <- eps
 detach.jags()
+
+summary(hsmu)
+summary(hssigma)
+summary(hssigma.eta)
+summary(hstheta)
 ```
 
+### Homoscedastic (constant-variance) Model
+
+The general model but without considering $n_{tj}$.
+```{r}
+BUGS.Cvar_model <- "
+model
+{
+  for (j in 1:M){
+    
+    # hidden state
+    x[1,j] <- mu[j] + eps[1,j]*sigma.eta[j]
+    eps[1,j] ~ dnorm(0,1)
+    for (t in 2:N){
+      x[t,j] <- (1-theta[j])*mu[j] + theta[j]*x[t-1,j]+ sigma.eta[j]*eps[t,j]
+      eps[t,j] ~ dnorm(0,1)
+    }
+    
+    # observed
+    for (t in 1:N){
+      y[t,j] ~ dnorm(x[t,j], tau[j])
+    }
+    
+    mu_aux[j] ~ dbeta(1,1) # in (0,1)
+    mu[j] <- 2*mu_aux[j]-1 # in (-1,1)
+  }
+  
+  for (j in 1:M){
+    theta_aux[j] ~ dnorm(mu_theta, pow(sigma_theta, -2))
+    theta[j] <- 1 / (1 + exp(-theta_aux[j]))
+    
+    # Lognormal distributions for the sd
+    # SD dynamic
+    log_sigma.eta[j] ~ dnorm(mu_log_sigma.eta, pow(sigma_log_sigma.eta, -2))
+    sigma.eta[j] <- exp(log_sigma.eta[j])
+    tau.eta[j] <- pow(sigma.eta[j], -2)
+    
+    # SD obs
+    log_sigma[j] ~ dnorm(mu_log_sigma, pow(sigma_log_sigma, -2))
+    sigma[j] <- exp(log_sigma[j])
+    tau[j] <- pow(sigma[j], -2)
+  }
+  
+  mu_theta ~ dnorm(0,1)
+  log_sigma_theta ~ dnorm(0, pow(0.35, -2))
+  sigma_theta <- exp(log_sigma_theta)
+  
+  mu_log_sigma.eta ~ dnorm(-3,1) # center arround exp(-3)=0.05
+  log_sigma_log_sigma.eta ~ dnorm(-0.7, pow(0.35, -2)) # mean exp(-0.7)=0.50, sdlog=0.35
+  sigma_log_sigma.eta <- exp(log_sigma_log_sigma.eta)
+  
+  mu_log_sigma ~ dnorm(-1.9, 1) # exp(-1.9)=0.15
+  log_sigma_log_sigma ~ dnorm(-0.7, pow(0.35, -2))
+  sigma_log_sigma <- exp(log_sigma_log_sigma)
+  
+}
+"
+```
+
+Train model and traceplot.
+```{r}
+Cvar_model <-jags(data, parameters.to.save=gparameters,
+ 		   model=textConnection(BUGS.Cvar_model),
+		   n.iter=(Iter*Thin+Burn),n.burnin=Burn, n.thin=Thin, n.chains=Chain)
+
+
+traceplot(Cvar_model, mfrow = c(2,2), varname = c("mu", "sigma", "sigma.eta", "theta", "mu_theta", "sigma_theta", 
+"mu_log_sigma.eta", "sigma_log_sigma.eta", 
+"mu_log_sigma", "sigma_log_sigma"))
+```
+
+Save parameters and show its summary.
+```{r}
+attach.jags(Cvar_model)
+cmu <- mu
+colnames(cmu) <- colnames(C2)
+csigma <- sigma
+csigma.eta <- sigma.eta
+ctheta <- theta
+cx <- x
+cmu_theta <- mu_theta
+csigma_theta <- sigma_theta
+cmu_log_sigma.eta<-mu_log_sigma.eta
+csigma_log_sigma.eta<-sigma_log_sigma.eta
+cmu_log_sigma<-mu_log_sigma
+csigma_log_sigma<-sigma_log_sigma
+ceps <- eps
+detach.jags()
+
+summary(cmu)
+summary(csigma)
+summary(csigma.eta)
+summary(ctheta)
+```
 ## Model evaluation and diagnostics
 
 Densities for the posterior distributions of the hierarchical hyperparameters (general model).
@@ -788,7 +889,7 @@ ppc_category <- function(y, n, draws, j,
 ppc_all_r2jags <- function(fit, y, n,
                            category_names = colnames(y),
                            type = c("posterior", "conditional", "forward"),
-                           nsim = 500, max_draws = 2000, seed = 1) {
+                           nsim = 500, max_draws = 2000, seed = 123) {
   type <- match.arg(type)
   if (is.null(category_names)) category_names <- paste0("cat_", 1:ncol(y))
 
@@ -829,9 +930,10 @@ saveRDS(res_ppc, "tables/res_ppc.rds")
 #res_fwd$summary
 
 ```
+### Essential Figures
+
 ```{r}
 setwd("/home/ian/Projects/BayesianNewsSentiment/")
-# ESSENTIAL FIGURES
 
 # CATEGORY LABELS
 LABELS <- c(
@@ -1075,6 +1177,236 @@ ggsave("figures/fig_exploratory.pdf", p_y_n, width = 10.5, height = 7.5, device 
 
 ```
 
+```{r}
+# x_draws: array [S, N, M]  (S draws, N time points, M categories)
+summarize_x_draws <- function(x_draws, x_dates, labels_M) {
+  stopifnot(length(dim(x_draws)) == 3)
+  S <- dim(x_draws)[1]
+  N <- dim(x_draws)[2]
+  M <- dim(x_draws)[3]
+
+  stopifnot(length(x_dates) == N)
+  stopifnot(length(labels_M) == M)
+
+  # summaries as matrices [N, M]
+  x_mean <- apply(x_draws, c(2, 3), mean, na.rm = TRUE)
+  x_q05  <- apply(x_draws, c(2, 3), quantile, probs = 0.05, na.rm = TRUE)
+  x_q95  <- apply(x_draws, c(2, 3), quantile, probs = 0.95, na.rm = TRUE)
+
+  # long dataframe: N*M rows
+  df_x <- tibble(
+    t        = rep(seq_len(N), times = M),
+    x        = rep(x_dates, times = M),
+    category = rep(labels_M, each = N),
+    x_mean   = as.vector(x_mean),
+    x05      = as.vector(x_q05),
+    x95      = as.vector(x_q95)
+  ) %>%
+    mutate(category = factor(category, levels = labels_M))
+
+  return(df_x)
+}
+
+# Time axis mapping
+df_time <- df %>%
+  distinct(temporal_id, week_start) %>%   # weekly
+  arrange(temporal_id)
+
+x_dates <- as.Date(df_time$week_start)
+stopifnot(length(x_dates) == N)
+
+# Long data for y and n
+df_long <- tibble(
+  t        = rep(seq_len(N), times = M),
+  x        = rep(x_dates, times = M),
+  category = rep(labels_M, each = N),
+  y        = as.vector(as.matrix(y)),
+  n        = as.vector(as.matrix(n))
+) %>%
+  mutate(
+    category = factor(category, levels = labels_M)
+  )
+
+# Summaries for BOTH models
+df_x_hetero <- summarize_x_draws(general_model$BUGSoutput$sims.list$x, x_dates, labels_M) %>%
+  mutate(model = "Heteroscedastic (scaled by n)")
+
+df_x_homo <- summarize_x_draws(Cvar_model$BUGSoutput$sims.list$x, x_dates, labels_M) %>%
+  mutate(model = "Homoscedastic (constant variance)")
+
+df_x_both <- bind_rows(df_x_hetero, df_x_homo) %>%
+  mutate(model = factor(model, levels = c(
+    "Heteroscedastic (scaled by n)",
+    "Homoscedastic (constant variance)"
+  )))
+
+# Convert x05/x95 into long format for plotting as lines
+df_x_bounds <- df_x_both %>%
+  select(t, x, category, model, x05, x95) %>%
+  pivot_longer(
+    cols = c(x05, x95),
+    names_to = "bound",
+    values_to = "value"
+  ) %>%
+  mutate(
+    bound = recode(bound,
+      x05 = "Lower 5%",
+      x95 = "Upper 95%"
+    ),
+    bound = factor(bound, levels = c("Lower 5%", "Upper 95%"))
+  )
+
+
+# Rescale n into vertical bars (as background)
+ymin <- -0.7
+ymax <-  0.5
+yrng <- ymax - ymin
+
+n_cap_val <- quantile(df_long$n, probs = 0.99, na.rm = TRUE)
+
+df_long <- df_long %>%
+  mutate(
+    n_cap = pmin(n, n_cap_val),
+    n01   = ifelse(is.finite(n_cap) & n_cap > 0, n_cap / max(n_cap, na.rm = TRUE), 0)
+  )
+
+bar_frac   <- 0.95
+bar_height <- yrng * bar_frac
+
+df_long <- df_long %>%
+  mutate(bar_top = ymin + n01 * bar_height)
+
+# X limits
+xmax_data <- df_long %>% pull(x) %>% max(na.rm = TRUE)
+x_margin  <- 1
+xmax_plot <- xmax_data + x_margin
+
+p_x_compare <- ggplot() +
+
+  # n(t,j) bars in the background (grey)
+  geom_linerange(
+    data = df_long,
+    aes(x = x, ymin = ymin, ymax = bar_top),
+    color = "grey70", alpha = 0.35, linewidth = 1.2
+  ) +
+
+  # Posterior interval bounds as lines (no ribbons, no mean)
+  geom_line(
+    data = df_x_bounds,
+    aes(x = x, y = value, color = model, linetype = bound),
+    linewidth = 0.9
+  ) +
+
+  # observed y as points
+  geom_point(
+    data = df_long,
+    aes(x = x, y = y),
+    color = "black",
+    alpha = 0.4,
+    size = 1.2
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+
+  facet_wrap(~ category, ncol = 2, drop = FALSE) +
+
+  coord_cartesian(
+    ylim = c(ymin, ymax),
+    xlim = c(min(df_long$x, na.rm = TRUE), xmax_plot)
+  ) +
+
+  labs(
+    x = "Week",
+    y = "Aggregated sentiment (y)",
+    color = "Model",
+    linetype = "Interval bound"
+  ) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  ) +
+
+  scale_x_date(
+    limits = c(min(df_long$x, na.rm = TRUE), xmax_plot),
+    breaks = scales::date_breaks("5 months"),
+    labels = scales::date_format("%Y-%m")
+  )
+
+p_x_compare
+
+ggsave("figures/fig_x_compare_hetero_vs_homo.pdf",
+       p_x_compare,
+       width = 10.5, height = 7.5, device = cairo_pdf)
+```
+In order to validate the relation this width has with $1/\sqrt n_{tj}$ we define the following model: 
+$$
+w_{tj} = \beta_0 + \beta_1 \frac{1}{\sqrt n_{tj}} + \beta_2I_{homo}+\beta_3 I_{homo} \frac{1}{\sqrt n_{tj}} + \text{category effects}
+$$
+Where $w_{tj}=x95_{tj}-x05_{tj}$ and $I_{homo}=1$ for the Homoscedastic model and $I_{homo}=0$ for the Heteroscedastic model.
+```{r}
+# define width and add n
+df_width <- df_x_both %>%
+  mutate(width90 = x95 - x05) %>%
+  left_join(df_long %>% select(t, category, n), by = c("t", "category"))
+
+# the relation
+df_width <- df_width %>%
+  mutate(inv_sqrt_n = 1 / sqrt(pmax(n, 1))) # log_n = log1p(n)
+
+# Spearman corr by category and model
+cor_by_cat <- df_width %>%
+  group_by(model, category) %>%
+  summarise(
+    spearman_rho = cor(inv_sqrt_n, width90, method = "spearman", use = "complete.obs"),
+    pearson_r    = cor(inv_sqrt_n, width90, method = "pearson",  use = "complete.obs"),
+    .groups = "drop"
+  )
+
+cor_by_cat # the correlation is clearly higher for the Heteroscedastic model
+
+summary(df_width$width90) # to put the magnitude of the coefficients into context
+sd(df_width$width90, na.rm = TRUE) 
+# to see how many standard deviations the width increases per unit of inv_sqrt_n
+
+fit <- lm(width90 ~ inv_sqrt_n * model + category, data = df_width)
+summary(fit)
+
+# A one-unit increase in $1/\sqrt n_{tj}$ widens the 90% credible interval 
+# by 0.0978 (\beta_1) in the heteroscedastic model, compared to 0.0412 (\beta_1-\beta_3) 
+# in the homoscedastic variant, implying that the heteroscedastic specification 
+# responds more strongly to changes in information density.
+
+# to show in the appendix
+coef_tab <- broom::tidy(fit) %>%
+  filter(!grepl("^category", term)) %>%
+  mutate(
+    term = recode(term,
+      "inv_sqrt_n" = "1/sqrt(n_tj)",
+      "modelHomoscedastic (constant variance)" = "I_homo",
+      "inv_sqrt_n:modelHomoscedastic (constant variance)" = "I_homo × 1/sqrt(n_tj)"
+    ),
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 2),
+    p.value = signif(p.value, 3)
+  ) %>%
+  select(term, estimate, std.error, statistic, p.value)
+
+gof <- broom::glance(fit) %>%
+  transmute(
+    nobs = nobs,
+    adj_r2 = round(adj.r.squared, 4)
+  )
+
+res_width_reg <- list(
+  coef_table = coef_tab,
+  gof = gof
+)
+
+saveRDS(res_width_reg, "tables/res_width_reg.rds")
+```
 ## Additional
 
 ### Extra plot
