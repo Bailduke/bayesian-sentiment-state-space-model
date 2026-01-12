@@ -1346,7 +1346,7 @@ w_{tj} = \beta_0 + \beta_1 \frac{1}{\sqrt n_{tj}} + \beta_2I_{homo}+\beta_3 I_{h
 $$
 Where $w_{tj}=x95_{tj}-x05_{tj}$ and $I_{homo}=1$ for the Homoscedastic model and $I_{homo}=0$ for the Heteroscedastic model.
 ```{r}
-# define width and add n
+# define width and add n to the df
 df_width <- df_x_both %>%
   mutate(width90 = x95 - x05) %>%
   left_join(df_long %>% select(t, category, n), by = c("t", "category"))
